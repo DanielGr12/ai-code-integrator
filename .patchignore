@@ -1,0 +1,63 @@
+# AI Code Integrator - Ignore Patterns
+# Files matching these patterns will be protected from patching
+
+# Lock files (dependency management)
+*.lock
+package-lock.json
+yarn.lock
+Pipfile.lock
+poetry.lock
+
+# Minified files (don't patch generated code)
+*.min.js
+*.min.css
+*.bundle.js
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+*.crt
+
+# Generated/compiled files
+*.pyc
+__pycache__/**
+*.class
+*.o
+*.so
+dist/**
+build/**
+
+# Node modules and dependencies
+node_modules/**
+vendor/**
+.venv/**
+venv/**
+
+# Git internals
+.git/**
+.gitignore
+
+# IDE and editor files
+.vscode/**
+.idea/**
+*.swp
+*.swo
+*~
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Large data files
+*.csv
+*.json
+*.xml
+# (remove above if you need to patch config JSONs)
+
+# Add your project-specific patterns below:
+# sensitive_config.yaml
+# legacy_code/**

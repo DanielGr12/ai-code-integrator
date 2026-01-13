@@ -5,8 +5,9 @@ import shutil
 import hashlib
 import time
 import difflib
+import subprocess
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 
 # --- DATA STRUCTURES ---
@@ -16,33 +17,76 @@ class PatchBlock:
     search_block: str
     replace_block: str
     valid_match: Optional[str] = None
-    line_number: Optional[int] = None  # For better UI feedback
-    match_quality: float = 0.0  # 0-100 similarity score
+    line_number: Optional[int] = None
+    match_quality: float = 0.0
+    enabled: bool = True  # For selective application
 
 @dataclass
 class PatchStatus:
     filename: str
-    status: str  # 'success', 'warning', 'error'
+    status: str
     message: str
     diff_preview: str = ""
     line_number: Optional[int] = None
     similarity_score: Optional[float] = None
     suggestions: List[str] = field(default_factory=list)
+    error_context: Optional[str] = None  # Actual code from file for AI feedback
+    file_content_preview: Optional[str] = None  # For copy-to-AI feature
 
 # --- CORE LOGIC ---
 class Patcher:
     HISTORY_FILE = ".patch_history.json"
     BACKUP_DIR = ".ai_backups"
-    MAX_HISTORY = 50  # Prevent history file from growing too large
-    SIMILARITY_THRESHOLD = 80  # Percentage
+    IGNORE_FILE = ".patchignore"
+    MAX_HISTORY = 50
+    SIMILARITY_THRESHOLD = 80
 
     def __init__(self):
         self.backup_dir = Path(self.BACKUP_DIR)
         self.backup_dir.mkdir(exist_ok=True)
+        self.ignore_patterns = self._load_ignore_patterns()
         self._clean_old_backups()
 
+    def _load_ignore_patterns(self) -> List[str]:
+        """Load patterns from .patchignore file."""
+        ignore_file = Path(self.IGNORE_FILE)
+        if not ignore_file.exists():
+            # Create default ignore file
+            defaults = [
+                "*.lock",
+                "*.min.js",
+                "*.min.css",
+                ".env*",
+                "node_modules/**",
+                "__pycache__/**",
+                "*.pyc",
+                ".git/**"
+            ]
+            ignore_file.write_text("\n".join(defaults))
+            return defaults
+        
+        patterns = []
+        for line in ignore_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                patterns.append(line)
+        return patterns
+
+    def _is_ignored(self, filepath: str) -> bool:
+        """Check if file matches ignore patterns."""
+        path = Path(filepath)
+        for pattern in self.ignore_patterns:
+            if '*' in pattern:
+                # Simple glob matching
+                pattern_re = pattern.replace('.', r'\.').replace('*', '.*').replace('?', '.')
+                if re.match(pattern_re, str(path)):
+                    return True
+            elif pattern in str(path):
+                return True
+        return False
+
     def _clean_old_backups(self, max_age_days: int = 7):
-        """Remove backups older than max_age_days to prevent disk bloat."""
+        """Remove backups older than max_age_days."""
         cutoff = time.time() - (max_age_days * 86400)
         for backup in self.backup_dir.glob("*.bak"):
             if backup.stat().st_mtime < cutoff:
@@ -52,7 +96,7 @@ class Patcher:
                     pass
 
     def _calculate_hash(self, filepath: str) -> str:
-        """Generates SHA256 hash to detect manual tampering."""
+        """Generates SHA256 hash."""
         path = Path(filepath)
         if not path.exists():
             return "EMPTY"
@@ -60,18 +104,26 @@ class Patcher:
 
     def _calculate_similarity(self, text1: str, text2: str) -> float:
         """Calculate similarity between two strings (0-100)."""
-        # Normalize whitespace for comparison
         norm1 = ' '.join(text1.split())
         norm2 = ' '.join(text2.split())
-        
         ratio = difflib.SequenceMatcher(None, norm1, norm2).ratio()
         return ratio * 100
 
+    def _get_context_window(self, content: str, start_line: int, window_size: int = 10) -> str:
+        """Extract surrounding lines for error reporting."""
+        lines = content.split('\n')
+        start = max(0, start_line - window_size // 2)
+        end = min(len(lines), start_line + window_size // 2)
+        
+        context_lines = []
+        for i in range(start, end):
+            marker = ">>>" if i == start_line else "   "
+            context_lines.append(f"{marker} {i+1:4d} | {lines[i]}")
+        
+        return "\n".join(context_lines)
+
     def _find_best_match(self, search_text: str, content: str) -> Tuple[Optional[str], Optional[int], float]:
-        """
-        Find the best match for search_text in content.
-        Returns: (matched_text, line_number, similarity_score)
-        """
+        """Find the best match for search_text in content."""
         lines = content.split('\n')
         search_lines = search_text.split('\n')
         search_len = len(search_lines)
@@ -81,7 +133,6 @@ class Patcher:
         best_score = 0.0
         best_matched_text = None
         
-        # Slide a window across the file
         for i in range(len(lines) - search_len + 1):
             window = '\n'.join(lines[i:i + search_len])
             score = self._calculate_similarity(search_text, window)
@@ -95,36 +146,134 @@ class Patcher:
         return best_matched_text, best_line, best_score
 
     def _generate_flexible_regex(self, search_text: str) -> str:
-        """
-        Advanced Regex Generation:
-        Tokenizes text and allows flexible whitespace matching.
-        """
+        """Advanced Regex Generation."""
         search_text = search_text.strip()
         if not search_text:
             return ""
-
         tokens = re.findall(r"[\w]+|[^\s\w]", search_text)
         escaped_tokens = [re.escape(t) for t in tokens]
         pattern = r"\s*".join(escaped_tokens)
-        
         return pattern
 
-    def _generate_diff_preview(self, original: str, modified: str, context_lines: int = 3) -> str:
-        """Generate a unified diff preview."""
+    def _generate_diff_preview(self, original: str, modified: str, format_type: str = "unified") -> str:
+        """Generate diff preview in unified or split format."""
         original_lines = original.split('\n')
         modified_lines = modified.split('\n')
         
-        diff = difflib.unified_diff(
-            original_lines,
-            modified_lines,
-            lineterm='',
-            n=context_lines
-        )
+        if format_type == "unified":
+            diff = difflib.unified_diff(
+                original_lines,
+                modified_lines,
+                lineterm='',
+                n=3
+            )
+            return '\n'.join(diff)
+        else:  # split
+            diff_html = []
+            for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, original_lines, modified_lines).get_opcodes():
+                if tag == 'equal':
+                    for line in original_lines[i1:i2]:
+                        diff_html.append(f"  {line}")
+                elif tag == 'delete':
+                    for line in original_lines[i1:i2]:
+                        diff_html.append(f"- {line}")
+                elif tag == 'insert':
+                    for line in modified_lines[j1:j2]:
+                        diff_html.append(f"+ {line}")
+                elif tag == 'replace':
+                    for line in original_lines[i1:i2]:
+                        diff_html.append(f"- {line}")
+                    for line in modified_lines[j1:j2]:
+                        diff_html.append(f"+ {line}")
+            return '\n'.join(diff_html)
+
+    def generate_ai_error_report(self, status: PatchStatus, file_content: str) -> str:
+        """Generate formatted error report for AI to fix the patch."""
+        report = [
+            "🔴 PATCH ERROR REPORT",
+            "=" * 60,
+            f"File: {status.filename}",
+            f"Status: {status.status.upper()}",
+            f"Error: {status.message}",
+            ""
+        ]
         
-        return '\n'.join(diff)
+        if status.error_context:
+            report.extend([
+                "Actual code found in file:",
+                "```",
+                status.error_context,
+                "```",
+                ""
+            ])
+        
+        if status.suggestions:
+            report.extend([
+                "Suggestions:",
+                *[f"  • {s}" for s in status.suggestions],
+                ""
+            ])
+        
+        report.extend([
+            "Please regenerate the SEARCH block with:",
+            "1. More unique context (function signature, comments)",
+            "2. Exact indentation from the actual file",
+            "3. At least 5-10 lines of surrounding code"
+        ])
+        
+        return "\n".join(report)
+
+    def check_git_status(self) -> Dict[str, any]:
+        """Check git repository status."""
+        try:
+            # Check if we're in a git repo
+            result = subprocess.run(
+                ['git', 'rev-parse', '--git-dir'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode != 0:
+                return {"is_repo": False}
+            
+            # Check for uncommitted changes
+            status_result = subprocess.run(
+                ['git', 'status', '--porcelain'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            dirty_files = []
+            if status_result.stdout:
+                for line in status_result.stdout.splitlines():
+                    if line.strip():
+                        dirty_files.append(line[3:])  # Remove status prefix
+            
+            return {
+                "is_repo": True,
+                "is_dirty": len(dirty_files) > 0,
+                "dirty_files": dirty_files
+            }
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return {"is_repo": False}
+
+    def stage_files(self, files: List[str]) -> bool:
+        """Stage files in git."""
+        try:
+            subprocess.run(
+                ['git', 'add'] + files,
+                capture_output=True,
+                timeout=5,
+                check=True
+            )
+            return True
+        except Exception:
+            return False
 
     def parse_response(self, text: str) -> List[PatchBlock]:
-        """Parse AI response into patch blocks with improved error handling."""
+        """Parse AI response into patch blocks."""
         pattern = re.compile(
             r"FILE:\s*(.*?)\n<<<<< SEARCH\n(.*?)\n=====\n(.*?)\n>>>>>",
             re.DOTALL
@@ -135,15 +284,15 @@ class Patcher:
         for fname, search, replace in matches:
             filename = fname.strip()
             
-            # Validate filename
             if not filename or filename.startswith('/'):
-                continue  # Skip invalid filenames
+                continue
                 
             blocks.append(PatchBlock(
                 filename=filename,
                 search_block=search,
                 replace_block=replace,
-                valid_match=None
+                valid_match=None,
+                enabled=True
             ))
         
         return blocks
@@ -155,10 +304,19 @@ class Patcher:
         for block in blocks:
             filepath = Path(block.filename)
             
+            # Check ignore patterns
+            if self._is_ignored(block.filename):
+                results.append(PatchStatus(
+                    block.filename,
+                    "error",
+                    "🚫 File is protected by .patchignore",
+                    suggestions=["Remove from .patchignore if you want to patch this file"]
+                ))
+                continue
+            
             # File creation case
             if not filepath.exists():
                 if block.search_block.strip() == "":
-                    # Validate parent directory exists
                     if not filepath.parent.exists():
                         results.append(PatchStatus(
                             block.filename,
@@ -234,6 +392,11 @@ class Patcher:
                     ))
                     continue
                 else:
+                    # Multiple matches - provide context for AI
+                    first_match_pos = content.find(block.search_block)
+                    first_match_line = content[:first_match_pos].count('\n')
+                    error_context = self._get_context_window(content, first_match_line, 15)
+                    
                     results.append(PatchStatus(
                         block.filename,
                         "error",
@@ -241,7 +404,9 @@ class Patcher:
                         suggestions=[
                             "Add more surrounding context to make the search unique",
                             "Include function/class signatures or unique comments"
-                        ]
+                        ],
+                        error_context=error_context,
+                        file_content_preview=content[:1000]
                     ))
                     continue
 
@@ -271,11 +436,15 @@ class Patcher:
                     ))
                     continue
                 elif len(matches) > 1:
+                    first_match_line = content[:matches[0].start()].count('\n')
+                    error_context = self._get_context_window(content, first_match_line, 15)
+                    
                     results.append(PatchStatus(
                         block.filename,
                         "error",
                         f"⛔ Found {len(matches)} similar blocks.",
-                        suggestions=["Provide more unique context"]
+                        suggestions=["Provide more unique context"],
+                        error_context=error_context
                     ))
                     continue
 
@@ -292,8 +461,10 @@ class Patcher:
                 diff = self._generate_diff_preview(
                     block.search_block,
                     best_match,
-                    context_lines=5
+                    "unified"
                 )
+                
+                error_context = self._get_context_window(content, line_num - 1, 15)
                 
                 results.append(PatchStatus(
                     block.filename,
@@ -305,9 +476,16 @@ class Patcher:
                     suggestions=[
                         "Verify the match is correct before applying",
                         "AI may have slightly different version of the code"
-                    ]
+                    ],
+                    error_context=error_context
                 ))
             else:
+                # No match found - provide best attempt for AI feedback
+                if line_num:
+                    error_context = self._get_context_window(content, line_num - 1, 20)
+                else:
+                    error_context = content[:500]
+                
                 results.append(PatchStatus(
                     block.filename,
                     "error",
@@ -316,19 +494,21 @@ class Patcher:
                         "Check if the file has been recently modified",
                         "Verify you're editing the correct file",
                         "AI may have hallucinated or used outdated code"
-                    ]
+                    ],
+                    error_context=error_context,
+                    file_content_preview=content
                 ))
 
         return results
 
-    def apply_patches(self, blocks: List[PatchBlock]) -> List[str]:
-        """
-        Apply patches with atomic transaction support.
-        Returns list of modified filenames.
-        """
+    def apply_patches(self, blocks: List[PatchBlock], auto_stage: bool = False) -> Tuple[List[str], str]:
+        """Apply patches with optional git staging."""
         timestamp = int(time.time())
         history_entry = {"timestamp": timestamp, "files": [], "description": ""}
         modified_files = []
+
+        # Filter to only enabled blocks
+        blocks = [b for b in blocks if b.enabled]
 
         # Pre-flight validation
         for block in blocks:
@@ -342,7 +522,6 @@ class Patcher:
         for block in blocks:
             filepath = Path(block.filename)
             
-            # Create new file
             if not filepath.exists():
                 filepath.parent.mkdir(parents=True, exist_ok=True)
                 filepath.write_text(block.replace_block, encoding='utf-8')
@@ -356,7 +535,6 @@ class Patcher:
                 modified_files.append(block.filename)
                 continue
 
-            # Delete file
             if block.replace_block.strip() == "":
                 backup_path = self.backup_dir / f"{filepath.name}_{timestamp}.bak"
                 shutil.copy(filepath, backup_path)
@@ -371,7 +549,6 @@ class Patcher:
                 modified_files.append(block.filename)
                 continue
 
-            # Modify file
             backup_path = self.backup_dir / f"{filepath.name}_{timestamp}.bak"
             shutil.copy(filepath, backup_path)
 
@@ -390,38 +567,38 @@ class Patcher:
                 })
                 modified_files.append(block.filename)
 
-        # Save history with size management
+        # Git integration
+        git_msg = ""
+        if auto_stage and modified_files:
+            if self.stage_files(modified_files):
+                git_msg = f" (Staged {len(modified_files)} files in git)"
+
         history = self._load_history()
         history.append(history_entry)
         
-        # Keep only recent history
         if len(history) > self.MAX_HISTORY:
             history = history[-self.MAX_HISTORY:]
         
         self._save_history(history)
         
-        return modified_files
+        return modified_files, git_msg
 
     def _load_history(self) -> list:
-        """Load patch history from file."""
+        """Load patch history."""
         history_path = Path(self.HISTORY_FILE)
         if not history_path.exists():
             return []
-        
         try:
             return json.loads(history_path.read_text())
         except Exception:
             return []
 
     def _save_history(self, history: list):
-        """Save patch history to file."""
+        """Save patch history."""
         Path(self.HISTORY_FILE).write_text(json.dumps(history, indent=2))
 
     def undo_last(self) -> Tuple[str, List[str]]:
-        """
-        Undo last patch with safety checks.
-        Returns: (status_message, list_of_restored_files)
-        """
+        """Undo last patch with safety checks."""
         history = self._load_history()
         if not history:
             return "No history to undo.", []
@@ -429,7 +606,6 @@ class Patcher:
         last_entry = history.pop()
         restored_files = []
 
-        # Verification phase
         for fentry in last_entry["files"]:
             filepath = Path(fentry["path"])
             
@@ -444,7 +620,6 @@ class Patcher:
                         f"Undoing will overwrite your changes."
                     ), []
 
-        # Restoration phase
         try:
             for fentry in last_entry["files"]:
                 filepath = Path(fentry["path"])
@@ -487,3 +662,16 @@ class Patcher:
             })
         
         return summaries
+
+    def get_file_content(self, filepath: str, max_chars: int = 50000) -> Optional[str]:
+        """Get file content for copying to AI."""
+        try:
+            path = Path(filepath)
+            if not path.exists():
+                return None
+            content = path.read_text(encoding='utf-8')
+            if len(content) > max_chars:
+                return content[:max_chars] + f"\n\n... (truncated, {len(content)} total chars)"
+            return content
+        except Exception:
+            return None
