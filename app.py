@@ -4,9 +4,40 @@ import os
 import time
 import glob
 from datetime import datetime
+from pathlib import Path
 from flask import Flask, request
 from flask_cors import CORS
 from patcher_core import Patcher
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# --- FILE WATCHER ---
+class PatcherFileHandler(FileSystemEventHandler):
+    """Watch for file changes and trigger re-analysis."""
+    
+    def __init__(self, watched_files):
+        self.watched_files = set(watched_files)
+        self.last_modified = {}
+    
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        
+        # Normalize path
+        file_path = str(Path(event.src_path).resolve())
+        
+        # Check if this is a watched file
+        for watched in self.watched_files:
+            if str(Path(watched).resolve()) == file_path:
+                # Debounce: only trigger if > 1 second since last modification
+                current_time = time.time()
+                last_time = self.last_modified.get(file_path, 0)
+                
+                if current_time - last_time > 1.0:
+                    self.last_modified[file_path] = current_time
+                    st.session_state.file_changed = True
+                    st.session_state.changed_file = watched
+                break
 
 # --- FLASK BACKGROUND SERVER ---
 server = Flask(__name__)
@@ -127,6 +158,96 @@ st.markdown("""
     .token-ok { color: #28a745; }
     .token-warning { color: #ffc107; }
     .token-danger { color: #dc3545; }
+    
+    /* Side-by-side diff */
+    .diff-container {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        font-family: 'Fira Code', monospace;
+        font-size: 12px;
+        max-height: 500px;
+        overflow: auto;
+    }
+    
+    .diff-side {
+        background: #f6f8fa;
+        border: 1px solid #d0d7de;
+        border-radius: 6px;
+        padding: 10px;
+    }
+    
+    .diff-line {
+        white-space: pre;
+        padding: 2px 5px;
+        line-height: 1.5;
+    }
+    
+    .diff-line-num {
+        display: inline-block;
+        width: 40px;
+        color: #6e7781;
+        text-align: right;
+        padding-right: 10px;
+        user-select: none;
+    }
+    
+    .diff-delete { background-color: #ffebe9; }
+    .diff-insert { background-color: #dafbe1; }
+    .diff-equal { background-color: transparent; }
+    .diff-empty { background-color: #f6f8fa; opacity: 0.3; }
+    
+    /* Syntax highlighting (basic) */
+    .syntax-keyword { color: #cf222e; font-weight: bold; }
+    .syntax-string { color: #0a3069; }
+    .syntax-comment { color: #6e7781; font-style: italic; }
+    .syntax-function { color: #8250df; }
+    .syntax-number { color: #0550ae; }
+    
+    /* Keyboard shortcut hints */
+    .kbd {
+        background: #f6f8fa;
+        border: 1px solid #d0d7de;
+        border-radius: 3px;
+        padding: 2px 6px;
+        font-size: 11px;
+        font-family: monospace;
+    }
+    
+    /* File watcher indicator */
+    .watch-indicator {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 5px;
+    }
+    .watch-active { background: #28a745; animation: pulse 2s infinite; }
+    .watch-inactive { background: #6c757d; }
+    
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+    
+    /* Dry run results */
+    .dry-run-box {
+        background: #e7f3ff;
+        border: 2px solid #2196F3;
+        border-radius: 8px;
+        padding: 15px;
+        margin: 15px 0;
+    }
+    
+    .dry-run-success {
+        background: #d4edda;
+        border-color: #28a745;
+    }
+    
+    .dry-run-failure {
+        background: #f8d7da;
+        border-color: #dc3545;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -143,11 +264,25 @@ if "git_message" not in st.session_state:
     st.session_state.git_message = ""
 if "analyzed_blocks" not in st.session_state:
     st.session_state.analyzed_blocks = None
+if "file_watcher" not in st.session_state:
+    st.session_state.file_watcher = None
+if "file_changed" not in st.session_state:
+    st.session_state.file_changed = False
+if "changed_file" not in st.session_state:
+    st.session_state.changed_file = None
+if "watch_enabled" not in st.session_state:
+    st.session_state.watch_enabled = False
+if "dry_run_result" not in st.session_state:
+    st.session_state.dry_run_result = None
+if "show_dry_run" not in st.session_state:
+    st.session_state.show_dry_run = False
 
 # --- HELPER FUNCTIONS ---
 def copy_to_clipboard_js(text: str) -> str:
     """Generate JavaScript to copy text to clipboard."""
+    # Escape characters that would break the JS template literal
     escaped_text = text.replace('`', '\\`').replace('$', '\\$')
+    
     return f"""
     <script>
     navigator.clipboard.writeText(`{escaped_text}`);
@@ -161,6 +296,89 @@ def get_project_files(pattern: str = "**/*.py") -> list:
         if not any(ignore in path for ignore in ['.git', '__pycache__', 'node_modules', '.ai_backups']):
             files.append(path)
     return sorted(files)
+
+def apply_basic_syntax_highlighting(code: str, language: str = "python") -> str:
+    """Apply basic syntax highlighting using HTML/CSS."""
+    if language == "python":
+        import re
+        # Keywords
+        code = re.sub(r'\b(def|class|if|else|elif|for|while|return|import|from|as|try|except|with|lambda|yield)\b', 
+                     r'<span class="syntax-keyword">\1</span>', code)
+        # Strings
+        code = re.sub(r'(["\'])(?:(?=(\\?))\2.)*?\1', 
+                     r'<span class="syntax-string">\g<0></span>', code)
+        # Comments
+        code = re.sub(r'(#.*$)', 
+                     r'<span class="syntax-comment">\1</span>', code, flags=re.MULTILINE)
+        # Numbers
+        code = re.sub(r'\b(\d+)\b', 
+                     r'<span class="syntax-number">\1</span>', code)
+    return code
+
+def render_side_by_side_diff(diff_data: dict) -> str:
+    """Render side-by-side diff as HTML."""
+    left_lines = diff_data["left_lines"]
+    right_lines = diff_data["right_lines"]
+    
+    html = ['<div class="diff-container">']
+    
+    # Left side (original)
+    html.append('<div class="diff-side"><strong>Original</strong><hr>')
+    for line_num, text, change_type in left_lines:
+        line_num_str = str(line_num) if line_num else ""
+        css_class = f"diff-{change_type}"
+        html.append(f'<div class="diff-line {css_class}">')
+        html.append(f'<span class="diff-line-num">{line_num_str}</span>')
+        html.append(f'{text}')
+        html.append('</div>')
+    html.append('</div>')
+    
+    # Right side (modified)
+    html.append('<div class="diff-side"><strong>Modified</strong><hr>')
+    for line_num, text, change_type in right_lines:
+        line_num_str = str(line_num) if line_num else ""
+        css_class = f"diff-{change_type}"
+        html.append(f'<div class="diff-line {css_class}">')
+        html.append(f'<span class="diff-line-num">{line_num_str}</span>')
+        html.append(f'{text}')
+        html.append('</div>')
+    html.append('</div>')
+    
+    html.append('</div>')
+    return ''.join(html)
+
+def start_file_watcher(files_to_watch: list):
+    """Start watching files for changes."""
+    if st.session_state.file_watcher is not None:
+        # Stop existing watcher
+        st.session_state.file_watcher.stop()
+        st.session_state.file_watcher = None
+    
+    if not files_to_watch:
+        return
+    
+    # Get unique directories to watch
+    directories = set()
+    for file_path in files_to_watch:
+        directories.add(str(Path(file_path).parent.resolve()))
+    
+    # Create observer
+    observer = Observer()
+    event_handler = PatcherFileHandler(files_to_watch)
+    
+    for directory in directories:
+        if Path(directory).exists():
+            observer.schedule(event_handler, directory, recursive=False)
+    
+    observer.start()
+    st.session_state.file_watcher = observer
+
+def stop_file_watcher():
+    """Stop file watching."""
+    if st.session_state.file_watcher is not None:
+        st.session_state.file_watcher.stop()
+        st.session_state.file_watcher.join(timeout=1)
+        st.session_state.file_watcher = None
 
 # --- INITIALIZE PATCHER ---
 patcher = Patcher()
@@ -293,6 +511,44 @@ Please use this EXACT code when generating the SEARCH block."""
             help="Choose diff preview style"
         )
         
+        st.markdown("---")
+        
+        # File watching
+        st.markdown("**File Watching**")
+        watch_enabled = st.checkbox(
+            "Auto-refresh on file changes",
+            value=st.session_state.watch_enabled,
+            help="Automatically re-analyze when tracked files change"
+        )
+        
+        if watch_enabled != st.session_state.watch_enabled:
+            st.session_state.watch_enabled = watch_enabled
+            if not watch_enabled:
+                stop_file_watcher()
+        
+        # Watch indicator
+        if st.session_state.watch_enabled:
+            st.markdown("""
+            <div style='font-size: 11px; margin-top: 5px;'>
+                <span class='watch-indicator watch-active'></span>
+                <span>Watching files...</span>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Dry run settings
+        st.markdown("**Dry Run Test Command**")
+        test_command = st.text_input(
+            "Command to run",
+            value="python -m pytest",
+            help="Command to run during dry run (e.g., 'python -m pytest', 'npm test')",
+            label_visibility="collapsed"
+        )
+        
+        if st.button("💾 Save Settings", use_container_width=True, type="secondary"):
+            st.success("Settings saved!")
+        
     st.markdown("---")
     
     # Help section
@@ -306,12 +562,43 @@ new code here
         st.caption("Use this format for all AI-generated patches")
     
     with st.expander("⌨️ Keyboard Shortcuts"):
-        st.text("Ctrl+Enter: Analyze")
-        st.text("Ctrl+Shift+Enter: Apply")
-        st.text("Ctrl+Z: Undo")
-        st.caption("(Coming soon)")
+        st.markdown("""
+        <table style='width: 100%; font-size: 12px;'>
+            <tr>
+                <td><span class='kbd'>Ctrl</span> + <span class='kbd'>Enter</span></td>
+                <td>Analyze patches</td>
+            </tr>
+            <tr>
+                <td><span class='kbd'>Ctrl</span> + <span class='kbd'>Shift</span> + <span class='kbd'>Enter</span></td>
+                <td>Apply changes</td>
+            </tr>
+            <tr>
+                <td><span class='kbd'>Ctrl</span> + <span class='kbd'>Z</span></td>
+                <td>Undo last patch</td>
+            </tr>
+            <tr>
+                <td><span class='kbd'>Ctrl</span> + <span class='kbd'>D</span></td>
+                <td>Dry run</td>
+            </tr>
+            <tr>
+                <td><span class='kbd'>Ctrl</span> + <span class='kbd'>K</span></td>
+                <td>Clear input</td>
+            </tr>
+        </table>
+        """, unsafe_allow_html=True)
+        st.caption("Shortcuts active when cursor in text area")
 
 # --- MAIN AREA ---
+
+# Check for file changes
+if st.session_state.file_changed and st.session_state.watch_enabled:
+    st.info(f"🔄 File changed: {st.session_state.changed_file}. Re-analyzing...")
+    if st.session_state.analyzed_blocks:
+        st.session_state.last_analysis = patcher.analyze_blocks(st.session_state.analyzed_blocks)
+    st.session_state.file_changed = False
+    st.session_state.changed_file = None
+    time.sleep(0.5)
+    st.rerun()
 
 # Header
 st.markdown("""
@@ -332,6 +619,40 @@ if st.session_state.show_success:
     st.session_state.show_success = False
     st.session_state.success_files = []
     st.session_state.git_message = ""
+
+# Dry run results
+if st.session_state.show_dry_run and st.session_state.dry_run_result:
+    result = st.session_state.dry_run_result
+    
+    if result["success"]:
+        st.markdown("""
+        <div class='dry-run-box dry-run-success'>
+            <h3 style='margin: 0 0 10px 0;'>✅ Dry Run Successful</h3>
+            <p style='margin: 5px 0;'><strong>Modified files:</strong> {}</p>
+        </div>
+        """.format(len(result["modified_files"])), unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class='dry-run-box dry-run-failure'>
+            <h3 style='margin: 0 0 10px 0;'>❌ Dry Run Failed</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        for error in result["errors"]:
+            st.error(error)
+    
+    if result.get("test_output"):
+        test = result["test_output"]
+        with st.expander("📋 Test Output", expanded=not test["success"]):
+            if test["stdout"]:
+                st.text("STDOUT:")
+                st.code(test["stdout"], language="bash")
+            if test["stderr"]:
+                st.text("STDERR:")
+                st.code(test["stderr"], language="bash")
+            st.text(f"Exit code: {test['returncode']}")
+    
+    st.session_state.show_dry_run = False
 
 # Input area
 col1, col2 = st.columns([4, 1])
@@ -370,13 +691,61 @@ with col1:
 with col2:
     st.markdown("### Quick Actions")
     
-    if st.button("🔍 Analyze", use_container_width=True, type="primary", key="analyze_btn"):
+    analyze_clicked = st.button("🔍 Analyze", use_container_width=True, type="primary", key="analyze_btn")
+    
+    # Keyboard shortcut handling
+    if raw_input:
+        # JavaScript for keyboard shortcuts
+        st.markdown("""
+        <script>
+        document.addEventListener('keydown', function(e) {
+            const textarea = document.querySelector('textarea');
+            if (!textarea) return;
+            
+            // Ctrl+Enter: Analyze
+            if (e.ctrlKey && e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                const analyzeBtn = Array.from(document.querySelectorAll('button')).find(btn => btn.textContent.includes('Analyze'));
+                if (analyzeBtn) analyzeBtn.click();
+            }
+            
+            // Ctrl+Shift+Enter: Apply
+            if (e.ctrlKey && e.shiftKey && e.key === 'Enter') {
+                e.preventDefault();
+                const applyBtn = Array.from(document.querySelectorAll('button')).find(btn => btn.textContent.includes('Apply'));
+                if (applyBtn) applyBtn.click();
+            }
+            
+            // Ctrl+K: Clear
+            if (e.ctrlKey && e.key === 'k') {
+                e.preventDefault();
+                const clearBtn = Array.from(document.querySelectorAll('button')).find(btn => btn.textContent.includes('Clear'));
+                if (clearBtn) clearBtn.click();
+            }
+            
+            // Ctrl+D: Dry Run
+            if (e.ctrlKey && e.key === 'd') {
+                e.preventDefault();
+                const dryRunBtn = Array.from(document.querySelectorAll('button')).find(btn => btn.textContent.includes('Dry Run'));
+                if (dryRunBtn) dryRunBtn.click();
+            }
+        });
+        </script>
+        """, unsafe_allow_html=True)
+    
+    if analyze_clicked:
         if raw_input.strip():
             with st.spinner("Analyzing patches..."):
                 blocks = patcher.parse_response(raw_input)
                 if blocks:
                     st.session_state.analyzed_blocks = blocks
                     st.session_state.last_analysis = patcher.analyze_blocks(blocks)
+                    
+                    # Start file watching if enabled
+                    if st.session_state.watch_enabled:
+                        files_to_watch = [b.filename for b in blocks if Path(b.filename).exists()]
+                        start_file_watcher(files_to_watch)
+                    
                     st.rerun()
                 else:
                     st.error("No valid patch blocks found")
@@ -387,12 +756,23 @@ with col2:
         st.session_state.incoming_patch = ""
         st.session_state.last_analysis = None
         st.session_state.analyzed_blocks = None
+        stop_file_watcher()
         st.rerun()
     
     if st.button("🔄 Refresh Files", use_container_width=True, help="Re-analyze if files changed"):
         if st.session_state.analyzed_blocks:
             st.session_state.last_analysis = patcher.analyze_blocks(st.session_state.analyzed_blocks)
             st.rerun()
+    
+    # Dry run button
+    if st.button("🧪 Dry Run", use_container_width=True, help="Test changes without applying"):
+        if st.session_state.analyzed_blocks:
+            with st.spinner("Running dry run..."):
+                test_cmd = test_command if 'test_command' in locals() else None
+                result = patcher.dry_run(st.session_state.analyzed_blocks, test_cmd)
+                st.session_state.dry_run_result = result
+                st.session_state.show_dry_run = True
+                st.rerun()
     
     if raw_input:
         blocks = patcher.parse_response(raw_input)
@@ -506,10 +886,25 @@ replacement code
                     # Diff preview
                     if res.diff_preview:
                         st.markdown("**Diff Preview:**")
-                        st.markdown(
-                            f"<div class='diff-preview'>{res.diff_preview}</div>",
-                            unsafe_allow_html=True
-                        )
+                        
+                        # Choose diff format
+                        current_diff_format = diff_format if 'diff_format' in locals() else "Unified"
+                        
+                        if current_diff_format == "Split" and block.valid_match:
+                            # Generate side-by-side diff
+                            diff_data = patcher.generate_side_by_side_diff(
+                                block.valid_match, 
+                                block.replace_block
+                            )
+                            html_diff = render_side_by_side_diff(diff_data)
+                            st.markdown(html_diff, unsafe_allow_html=True)
+                        else:
+                            # Unified diff with basic syntax highlighting
+                            highlighted = apply_basic_syntax_highlighting(res.diff_preview, "python")
+                            st.markdown(
+                                f"<div class='diff-preview'>{highlighted}</div>",
+                                unsafe_allow_html=True
+                            )
                     
                     # Suggestions
                     if res.suggestions:
@@ -580,7 +975,7 @@ replacement code
                 4. Or use "Copy File Content" in sidebar to give AI current file state
                 """)
 
-# Footer
+# --- FOOTER ---
 st.markdown("---")
 col1, col2, col3 = st.columns(3)
 with col2:

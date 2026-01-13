@@ -675,3 +675,168 @@ class Patcher:
             return content
         except Exception:
             return None
+
+    def dry_run(self, blocks: List[PatchBlock], test_command: Optional[str] = None) -> Dict[str, any]:
+        """
+        Perform dry run by applying patches to temporary copies and optionally running tests.
+        
+        Returns dict with:
+        - success: bool
+        - modified_files: list of temp file paths
+        - test_output: optional test results
+        - errors: list of error messages
+        """
+        import tempfile
+        
+        result = {
+            "success": True,
+            "modified_files": [],
+            "test_output": None,
+            "errors": []
+        }
+        
+        temp_dir = Path(tempfile.mkdtemp(prefix="patcher_dryrun_"))
+        temp_files = {}
+        
+        try:
+            # Filter enabled blocks
+            blocks = [b for b in blocks if b.enabled]
+            
+            # Copy files to temp directory
+            for block in blocks:
+                src_path = Path(block.filename)
+                if src_path.exists():
+                    # Maintain directory structure
+                    temp_path = temp_dir / block.filename
+                    temp_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(src_path, temp_path)
+                    temp_files[block.filename] = temp_path
+                else:
+                    # New file
+                    temp_path = temp_dir / block.filename
+                    temp_path.parent.mkdir(parents=True, exist_ok=True)
+                    temp_files[block.filename] = temp_path
+            
+            # Apply patches to temp files
+            for block in blocks:
+                temp_path = temp_files[block.filename]
+                
+                if not temp_path.exists():
+                    # Create new file
+                    temp_path.write_text(block.replace_block, encoding='utf-8')
+                    result["modified_files"].append(str(temp_path))
+                    continue
+                
+                if block.replace_block.strip() == "":
+                    # Delete file
+                    temp_path.unlink()
+                    result["modified_files"].append(f"{temp_path} (deleted)")
+                    continue
+                
+                # Modify file
+                content = temp_path.read_text(encoding='utf-8')
+                if block.valid_match:
+                    new_content = content.replace(block.valid_match, block.replace_block, 1)
+                    temp_path.write_text(new_content, encoding='utf-8')
+                    result["modified_files"].append(str(temp_path))
+            
+            # Run test command if provided
+            if test_command:
+                try:
+                    # Run command in temp directory
+                    test_result = subprocess.run(
+                        test_command,
+                        shell=True,
+                        cwd=temp_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    result["test_output"] = {
+                        "returncode": test_result.returncode,
+                        "stdout": test_result.stdout,
+                        "stderr": test_result.stderr,
+                        "success": test_result.returncode == 0
+                    }
+                    
+                    if test_result.returncode != 0:
+                        result["success"] = False
+                        result["errors"].append(f"Test command failed with code {test_result.returncode}")
+                
+                except subprocess.TimeoutExpired:
+                    result["success"] = False
+                    result["errors"].append("Test command timed out after 30 seconds")
+                except Exception as e:
+                    result["success"] = False
+                    result["errors"].append(f"Test command error: {str(e)}")
+        
+        except Exception as e:
+            result["success"] = False
+            result["errors"].append(f"Dry run error: {str(e)}")
+        
+        finally:
+            # Cleanup temp directory
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+        
+        return result
+
+    def generate_side_by_side_diff(self, original: str, modified: str) -> Dict[str, list]:
+        """
+        Generate side-by-side diff data structure.
+        
+        Returns dict with:
+        - left_lines: list of (line_num, line_text, change_type)
+        - right_lines: list of (line_num, line_text, change_type)
+        """
+        original_lines = original.split('\n')
+        modified_lines = modified.split('\n')
+        
+        left_lines = []
+        right_lines = []
+        
+        left_num = 1
+        right_num = 1
+        
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, original_lines, modified_lines).get_opcodes():
+            if tag == 'equal':
+                for i in range(i1, i2):
+                    left_lines.append((left_num, original_lines[i], 'equal'))
+                    right_lines.append((right_num, modified_lines[j1 + (i - i1)], 'equal'))
+                    left_num += 1
+                    right_num += 1
+            
+            elif tag == 'delete':
+                for i in range(i1, i2):
+                    left_lines.append((left_num, original_lines[i], 'delete'))
+                    right_lines.append((None, '', 'empty'))
+                    left_num += 1
+            
+            elif tag == 'insert':
+                for j in range(j1, j2):
+                    left_lines.append((None, '', 'empty'))
+                    right_lines.append((right_num, modified_lines[j], 'insert'))
+                    right_num += 1
+            
+            elif tag == 'replace':
+                max_len = max(i2 - i1, j2 - j1)
+                for k in range(max_len):
+                    if k < (i2 - i1):
+                        left_lines.append((left_num, original_lines[i1 + k], 'delete'))
+                        left_num += 1
+                    else:
+                        left_lines.append((None, '', 'empty'))
+                    
+                    if k < (j2 - j1):
+                        right_lines.append((right_num, modified_lines[j1 + k], 'insert'))
+                        right_num += 1
+                    else:
+                        right_lines.append((None, '', 'empty'))
+        
+        return {
+            "left_lines": left_lines,
+            "right_lines": right_lines
+        }
